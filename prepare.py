@@ -27,6 +27,7 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
+# 固定比較基準：所有實驗都共享同一組序列長度、時間預算與驗證 token 數。
 MAX_SEQ_LEN = 2048       # context length
 TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
 EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
@@ -181,6 +182,8 @@ def train_tokenizer():
     t1 = time.time()
     print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
 
+    # 建一份 token_id -> UTF-8 byte 長度對照表，讓 BPB 評估時可直接查表。
+    # 特殊 token 不代表真實文字內容，因此 byte 長度記成 0。
     # --- Build token_bytes lookup for BPB evaluation ---
     print("Tokenizer: building token_bytes lookup...")
     special_set = set(SPECIAL_TOKENS)
@@ -292,6 +295,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
+    # 先配置好 CPU pinned memory 與 GPU buffer，避免每個 batch 重複配置記憶體。
+    # 這裡把 inputs / targets 放在同一塊連續空間，重點是降低搬運成本。
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
@@ -310,6 +315,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
                 remaining = row_capacity - pos
 
+                # 從 buffer 裡找「放得下的最大文件」，盡量把每一列塞滿，
+                # 這樣在固定 5 分鐘內能餵更多有效 token 給 GPU。
                 # Find largest doc that fits entirely
                 best_idx = -1
                 best_len = 0
@@ -324,6 +331,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
                     row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
                     pos += len(doc)
                 else:
+                    # 如果沒有文件能完整塞入剩餘空間，就裁最短文件補滿，
+                    # 目標是維持 100% token 利用率，而不是保留 padding。
                     # No doc fits — crop shortest to fill remaining
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
@@ -348,6 +357,8 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
+    # BPB 的分母不是 token 數，而是真實 byte 數。
+    # 這讓不同 tokenizer / vocab 設計之間仍可公平比較。
     token_bytes = get_token_bytes(device="cuda")
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)

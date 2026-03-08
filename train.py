@@ -79,6 +79,8 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
+        # 核心實驗設計之一：把 token 專屬的 value embedding 混入 V，
+        # 再用依輸入而變的 gate 控制每個 KV head 的混入強度。
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
@@ -196,6 +198,8 @@ class GPT(nn.Module):
         assert all(c in "SL" for c in pattern)
         long_window = config.sequence_len
         short_window = long_window // 2
+        # S = 半窗、L = 全窗；用固定 pattern 讓部分層省注意力成本，
+        # 最後一層強制用全窗，避免輸出層資訊過度受限。
         char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
         window_sizes = []
         for layer_idx in range(config.n_layer):
@@ -246,6 +250,8 @@ class GPT(nn.Module):
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        # 把參數拆群是這個 repo 的關鍵：矩陣參數走 Muon，其餘走 AdamW，
+        # 並且讓 embedding / lm_head / scalar 各自有不同學習率。
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
@@ -273,6 +279,7 @@ class GPT(nn.Module):
         x = norm(x)
         x0 = x
         for i, block in enumerate(self.transformer.h):
+            # 每層都混合目前殘差流與最初 embedding，讓模型自己學每層要保留多少 x / x0。
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
@@ -319,6 +326,8 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # Muon 的核心步驟：先把梯度往近似正交方向整理，再做變異縮放。
+    # 目標不是一般 Adam 式逐元素更新，而是更偏向矩陣幾何上的更新。
     # Polar express orthogonalization
     X = g.bfloat16()
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
@@ -428,6 +437,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
+# 這一區就是 agent 主要搜索空間：改模型大小、窗型、batch 與各類 LR。
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
@@ -493,6 +503,7 @@ print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+# 用 grad accumulation 把單卡 micro-batch 組成固定的總 token 預算。
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
 optimizer = model.setup_optimizer(
@@ -550,6 +561,8 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
+    # 所有 schedule 都用「已消耗的訓練時間 / 固定 300 秒預算」來推進，
+    # 這樣不同模型結構仍能在同一個 wall-clock 標準下比較。
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
@@ -565,6 +578,7 @@ while True:
 
     train_loss_f = train_loss.item()
 
+    # 讓明顯爆炸的實驗快速失敗，避免浪費整個 5 分鐘配額。
     # Fast fail: abort if loss is exploding
     if train_loss_f > 100:
         print("FAIL")
@@ -598,6 +612,7 @@ while True:
 
     step += 1
 
+    # 前幾步包含 compile / 啟動開銷，不納入正式 300 秒訓練時間。
     # Time's up — but only stop after warmup steps so we don't count compilation
     if step > 10 and total_training_time >= TIME_BUDGET:
         break
@@ -606,6 +621,7 @@ print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
+# 最後只看固定驗證流程算出的 val_bpb，這是是否保留實驗的主依據。
 # Final eval
 model.eval()
 with autocast_ctx:
